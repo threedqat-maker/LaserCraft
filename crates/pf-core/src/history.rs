@@ -33,6 +33,11 @@ pub enum Command {
     /// layer joins the first existing layer with the same color and mode,
     /// or is appended as a new layer.
     ImportDocument(Document),
+    /// Creates a new laser-processing layer.
+    AddLayer {
+        name: String,
+        color: [u8; 3],
+    },
     /// Adds one new shape to an existing layer, or creates the default layer
     /// when the document has none.
     CreateShape {
@@ -48,6 +53,11 @@ pub enum Command {
     },
     /// New transforms for existing shapes.
     SetTransforms(Vec<(ShapeId, Transform)>),
+    /// Applies a group of edits as one all-or-nothing undo step.
+    Batch {
+        label: &'static str,
+        commands: Vec<Command>,
+    },
     DeleteShapes(Vec<ShapeId>),
     AssignShapes {
         ids: Vec<ShapeId>,
@@ -92,9 +102,11 @@ impl Command {
     pub fn label(&self) -> &'static str {
         match self {
             Command::ImportDocument(_) => "Import",
+            Command::AddLayer { .. } => "Add layer",
             Command::CreateShape { .. } => "Draw shape",
             Command::SetShapeGeometry { .. } => "Edit node",
             Command::SetTransforms(_) => "Transform",
+            Command::Batch { label, .. } => label,
             Command::DeleteShapes(_) => "Delete",
             Command::AssignShapes { .. } => "Assign to layer",
             Command::SetLayerName { .. } => "Rename layer",
@@ -161,6 +173,7 @@ enum Change {
         after_kind: ShapeKind,
         after_transform: Transform,
     },
+    Batch(Vec<Change>),
 }
 
 impl Change {
@@ -210,6 +223,9 @@ impl Change {
                 after_kind: before_kind.clone(),
                 after_transform: *before_transform,
             },
+            Change::Batch(changes) => {
+                Change::Batch(changes.iter().rev().map(Change::inverse).collect())
+            }
         }
     }
 
@@ -376,6 +392,16 @@ impl History {
 fn plan(doc: &Document, command: Command) -> Result<Change, HistoryError> {
     let change = match command {
         Command::ImportDocument(imported) => plan_import(doc, &imported)?,
+        Command::AddLayer { name, color } => {
+            let id = LayerId(doc.next_layer_id());
+            doc.next_layer_id()
+                .checked_add(1)
+                .ok_or(DocumentError::IdsExhausted("layer"))?;
+            Change::Insert {
+                layers: vec![(doc.layers().len(), Layer::new(id, name, color))],
+                shapes: Vec::new(),
+            }
+        }
         Command::CreateShape {
             kind,
             transform,
@@ -404,6 +430,16 @@ fn plan(doc: &Document, command: Command) -> Result<Change, HistoryError> {
                 planned.push((id, from, to));
             }
             Change::Transforms(planned)
+        }
+        Command::Batch { commands, .. } => {
+            let mut simulated = doc.clone();
+            let mut changes = Vec::with_capacity(commands.len());
+            for command in commands {
+                let change = plan(&simulated, command)?;
+                perform(&mut simulated, &change)?;
+                changes.push(change);
+            }
+            Change::Batch(changes)
         }
         Command::DeleteShapes(ids) => {
             let index = shape_index(doc);
@@ -685,6 +721,13 @@ fn perform(doc: &mut Document, change: &Change) -> Result<(), HistoryError> {
                 shape.kind = after_kind.clone();
                 shape.transform = *after_transform;
             }
+        }
+        Change::Batch(changes) => {
+            let mut next = doc.clone();
+            for change in changes {
+                perform(&mut next, change)?;
+            }
+            *doc = next;
         }
     }
     Ok(())

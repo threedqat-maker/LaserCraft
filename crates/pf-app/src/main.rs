@@ -3,6 +3,7 @@
 mod actions;
 mod app;
 mod display;
+mod modifiers;
 mod panels;
 mod state;
 

@@ -3,8 +3,10 @@
 use std::time::Duration;
 
 use egui::{Color32, Key, KeyboardShortcut, Modifiers, Pos2, Sense, Stroke, StrokeKind};
+use pf_core::layer::PALETTE;
 
 use crate::actions;
+use crate::modifiers;
 use crate::panels::{
     canvas, connection, console, control, import_warnings, layers, machine, preview,
 };
@@ -42,21 +44,22 @@ impl eframe::App for PhotonForgeApp {
         egui::Panel::bottom("status_bar").show(ui, |ui| show_status_bar(ui, &mut self.state));
         egui::Panel::left("tool_bar")
             .resizable(false)
-            .default_size(46.0)
+            .default_size(58.0)
             .show(ui, |ui| {
                 ui.vertical_centered(|ui| {
-                    tool_button(ui, &mut self.state, CanvasTool::Select, "Select");
-                    tool_button(ui, &mut self.state, CanvasTool::Rectangle, "Draw rectangle");
-                    tool_button(ui, &mut self.state, CanvasTool::Ellipse, "Draw ellipse");
-                    tool_button(ui, &mut self.state, CanvasTool::Polygon, "Draw hexagon");
+                    tool_button(ui, &mut self.state, CanvasTool::Select, "Select: click a shape to select it; drag to move or resize. Shift-click adds to the selection.");
+                    tool_button(ui, &mut self.state, CanvasTool::Rectangle, "Rectangle: click and drag on the work area to draw a rectangle.");
+                    tool_button(ui, &mut self.state, CanvasTool::Ellipse, "Ellipse: click and drag on the work area to draw an ellipse.");
+                    tool_button(ui, &mut self.state, CanvasTool::Polygon, "Polygon: click and drag on the work area to draw a regular hexagon.");
                     tool_button(
                         ui,
                         &mut self.state,
                         CanvasTool::Star,
-                        "Draw five-point star",
+                        "Star: click and drag on the work area to draw a five-point star.",
                     );
-                    tool_button(ui, &mut self.state, CanvasTool::Line, "Draw line");
-                    tool_button(ui, &mut self.state, CanvasTool::EditNodes, "Edit nodes");
+                    tool_button(ui, &mut self.state, CanvasTool::Line, "Line: click to add connected vertices. Click the start point to close the path; press Esc to finish it open. Shift snaps to 45°.");
+                    tool_button(ui, &mut self.state, CanvasTool::EditNodes, "Edit Nodes: click nodes to select; drag nodes or curve handles. I inserts a node, S smooths, L makes a line, C makes a corner, D deletes, B breaks, T trims, E extends, A aligns. Right-click for the full menu.");
+                    modifiers::show_toolbar(ui, &mut self.state);
                 });
             });
         if self.state.device.show_console {
@@ -87,8 +90,14 @@ fn tool_button(ui: &mut egui::Ui, state: &mut AppState, tool: CanvasTool, label:
     };
     draw_tool_icon(painter, rect, tool, color);
     let clicked = response.clicked();
-    response.on_hover_text(label);
+    let response = response.on_hover_text(label);
+    if tool == CanvasTool::EditNodes {
+        response.context_menu(|ui| canvas::show_node_editor_menu(ui, state));
+    }
     if clicked {
+        if state.canvas_tool == CanvasTool::RoundCorners {
+            state.rounding_nodes.clear();
+        }
         if state.canvas_tool == CanvasTool::Line && tool != CanvasTool::Line {
             state.line_points.clear();
             state.interaction = crate::state::Interaction::Idle;
@@ -96,6 +105,9 @@ fn tool_button(ui: &mut egui::Ui, state: &mut AppState, tool: CanvasTool, label:
         state.canvas_tool = tool;
         if tool != CanvasTool::EditNodes {
             state.selected_node = None;
+            state.selected_nodes.clear();
+            state.selected_segment = None;
+            state.selected_segment_point = None;
         }
     }
 }
@@ -156,6 +168,15 @@ fn draw_tool_icon(painter: &egui::Painter, rect: egui::Rect, tool: CanvasTool, c
                 painter.circle_stroke(node, 2.5, stroke);
             }
         }
+        CanvasTool::RoundCorners => {
+            painter.rect_stroke(
+                egui::Rect::from_center_size(center, egui::vec2(16.0, 16.0)),
+                4.0,
+                stroke,
+                StrokeKind::Middle,
+            );
+            painter.circle_filled(point(5.0, 5.0), 2.0, color);
+        }
     }
 }
 
@@ -203,7 +224,10 @@ fn show_menu_bar(ui: &mut egui::Ui, state: &mut AppState) {
             if redo.clicked() {
                 actions::redo(state);
             }
+            ui.separator();
+            ui.menu_button("Node editor", |ui| canvas::show_node_editor_menu(ui, state));
         });
+        ui.menu_button("Modifiers", |ui| modifiers::show_menu(ui, state));
         ui.menu_button("View", |ui| {
             if ui.button("Fit work area (F)").clicked() {
                 state.needs_fit = true;
@@ -297,6 +321,8 @@ fn show_status_bar(ui: &mut egui::Ui, state: &mut AppState) {
             area.width(),
             area.height()
         ));
+        ui.separator();
+        show_layer_palette(ui, state);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.label(format!("{:.0}%", state.viewport.zoom() * 100.0));
             if let Some(device) = device_summary(&state.device.snapshot) {
@@ -310,6 +336,50 @@ fn show_status_bar(ui: &mut egui::Ui, state: &mut AppState) {
     });
     if stop {
         actions::device_control(state, pf_device::ControlRequest::Stop);
+    }
+}
+
+fn show_layer_palette(ui: &mut egui::Ui, state: &mut AppState) {
+    let active = state
+        .selected_layer
+        .filter(|id| state.document.layer(*id).is_some())
+        .or_else(|| state.document.layers().first().map(|layer| layer.id));
+    for (index, color) in PALETTE.iter().copied().enumerate() {
+        let is_selected = active
+            .and_then(|id| state.document.layer(id))
+            .is_some_and(|layer| layer.color == color);
+        let [r, g, b] = color;
+        let background = Color32::from_rgb(r, g, b);
+        let luminance = (u32::from(r) * 299 + u32::from(g) * 587 + u32::from(b) * 114) / 1000;
+        let foreground = if luminance < 140 {
+            Color32::WHITE
+        } else {
+            Color32::BLACK
+        };
+        let button = egui::Button::new(
+            egui::RichText::new(format!("{index:02}"))
+                .size(10.0)
+                .color(foreground),
+        )
+        .fill(background)
+        .stroke(Stroke::new(
+            if is_selected { 2.0 } else { 0.5 },
+            if is_selected {
+                Color32::WHITE
+            } else {
+                Color32::from_gray(90)
+            },
+        ))
+        .min_size(egui::vec2(24.0, 22.0));
+        if ui
+            .add(button)
+            .on_hover_text(format!(
+                "Layer {index:02} · #{r:02X}{g:02X}{b:02X}. Click to select it or create it if it does not exist."
+            ))
+            .clicked()
+        {
+            actions::select_or_add_palette_layer(state, index, color);
+        }
     }
 }
 

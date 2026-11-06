@@ -7,7 +7,7 @@ use std::time::Instant;
 
 use pf_core::{
     Document, Handle, History, LayerId, MachineError, MachineProfile, Origin, Point, Rect, ShapeId,
-    Viewport,
+    Vec2, Viewport,
 };
 use pf_device::{Connection, DEFAULT_BAUD, DEFAULT_POLL_HZ, DeviceSnapshot, JobKind, PortInfo};
 use pf_gcode::JobOptions;
@@ -37,6 +37,22 @@ pub enum CanvasTool {
     Star,
     Line,
     EditNodes,
+    RoundCorners,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OffsetDirection {
+    #[default]
+    Outward,
+    Inward,
+    Both,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OffsetCornerStyle {
+    #[default]
+    Rounded,
+    Sharp,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,6 +60,26 @@ pub struct NodeRef {
     pub shape_id: ShapeId,
     pub subpath: usize,
     pub anchor: usize,
+}
+
+/// A path segment currently targeted by a node-edit command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SegmentRef {
+    pub shape_id: ShapeId,
+    pub subpath: usize,
+    pub segment: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeHandleSide {
+    Incoming,
+    Outgoing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NodeHandleRef {
+    pub node: NodeRef,
+    pub side: NodeHandleSide,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,6 +122,12 @@ pub enum Interaction {
     MoveNode {
         node: NodeRef,
         start: Point,
+    },
+    MoveNodeHandle {
+        handle: NodeHandleRef,
+        pointer_offset: Vec2,
+        opposite_length: Option<f64>,
+        smooth: bool,
     },
 }
 
@@ -246,6 +288,12 @@ pub struct AppState {
     /// Vertices accumulated by the click-to-draw line tool.
     pub line_points: Vec<Point>,
     pub selected_node: Option<NodeRef>,
+    /// Additional nodes selected with Shift while editing a path.
+    pub selected_nodes: Vec<NodeRef>,
+    /// Corners chosen in the click-to-round tool.
+    pub rounding_nodes: Vec<NodeRef>,
+    pub selected_segment: Option<SegmentRef>,
+    pub selected_segment_point: Option<Point>,
     /// An arrow-key nudge is in progress; its steps merge into one undo step.
     pub nudging: bool,
     /// Fit the work area into the canvas on the next frame.
@@ -265,6 +313,18 @@ pub struct AppState {
     /// Draw the planned toolpaths over the canvas.
     pub show_preview: bool,
     pub show_travels: bool,
+    /// Modifier menu parameters, in millimeters unless stated otherwise.
+    pub modifier_offset_mm: f64,
+    pub modifier_offset_direction: OffsetDirection,
+    pub modifier_offset_corner_style: OffsetCornerStyle,
+    pub modifier_corner_radius_mm: f64,
+    pub modifier_array_columns: u32,
+    pub modifier_array_rows: u32,
+    pub modifier_array_spacing_x_mm: f64,
+    pub modifier_array_spacing_y_mm: f64,
+    pub modifier_circular_count: u32,
+    /// Color preselected by the Add Layer control.
+    pub draft_layer_color: [u8; 3],
 }
 
 impl AppState {
@@ -283,6 +343,10 @@ impl AppState {
             canvas_tool: CanvasTool::Select,
             line_points: Vec::new(),
             selected_node: None,
+            selected_nodes: Vec::new(),
+            rounding_nodes: Vec::new(),
+            selected_segment: None,
+            selected_segment_point: None,
             nudging: false,
             needs_fit: true,
             cursor_mm: None,
@@ -297,6 +361,16 @@ impl AppState {
             preview: PreviewCache::default(),
             show_preview: false,
             show_travels: true,
+            modifier_offset_mm: 2.0,
+            modifier_offset_direction: OffsetDirection::Outward,
+            modifier_offset_corner_style: OffsetCornerStyle::Rounded,
+            modifier_corner_radius_mm: 2.0,
+            modifier_array_columns: 3,
+            modifier_array_rows: 2,
+            modifier_array_spacing_x_mm: 10.0,
+            modifier_array_spacing_y_mm: 10.0,
+            modifier_circular_count: 6,
+            draft_layer_color: [255, 0, 0],
         }
     }
 

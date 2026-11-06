@@ -26,8 +26,21 @@ enum Edit {
 
 pub fn show_layers(ui: &mut egui::Ui, state: &mut AppState) {
     ui.heading("Layers");
+    let mut add_layer = false;
+    ui.horizontal(|ui| {
+        ui.label("New layer");
+        egui::color_picker::color_edit_button_srgb(ui, &mut state.draft_layer_color);
+        add_layer = ui
+            .button("Add layer")
+            .on_hover_text("Create and select a layer with this color")
+            .clicked();
+    });
+    if add_layer {
+        let name = format!("Layer {}", state.document.layers().len() + 1);
+        actions::add_layer(state, name, state.draft_layer_color);
+    }
     let Some(current) = current_layer(state) else {
-        ui.weak("No layers yet. Import an SVG to get started.");
+        ui.weak("No layers yet. Add one here or click a color swatch in the bottom palette.");
         return;
     };
     let mut edits = Vec::new();

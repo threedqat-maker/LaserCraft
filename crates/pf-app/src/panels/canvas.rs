@@ -11,7 +11,10 @@ use pf_core::{
 use pf_gcode::GcodeError;
 
 use crate::actions;
-use crate::state::{AppState, CanvasTool, Interaction, NodeRef};
+use crate::state::{
+    AppState, CanvasTool, Interaction, NodeHandleRef, NodeHandleSide, NodeRef, SegmentRef,
+    StatusLevel,
+};
 
 const FIT_MARGIN_PX: f64 = 24.0;
 const MIN_GRID_PX: f64 = 10.0;
@@ -85,7 +88,7 @@ pub fn show_canvas(ui: &mut egui::Ui, state: &mut AppState) {
     draw_shapes(&painter, state, screen, preview);
     draw_shape_preview(&painter, state, pointer, shift);
     draw_node_preview(&painter, state, pointer);
-    draw_node_handles(&painter, state);
+    draw_node_handles(&painter, state, pointer);
     if state.show_preview {
         draw_toolpaths(&painter, state);
     }
@@ -134,6 +137,37 @@ fn handle_tool_input(ui: &egui::Ui, response: &egui::Response, state: &mut AppSt
     let world = |pos: Pos2| vp.to_world(to_point(pos));
     let shift = ui.input(|i| i.modifiers.shift);
 
+    if state.canvas_tool == CanvasTool::RoundCorners {
+        if response.clicked_by(PointerButton::Primary)
+            && let Some(pos) = response.interact_pointer_pos()
+        {
+            if let Some(node) = nearest_roundable_node(state, world(pos)) {
+                if let Some(index) = state
+                    .rounding_nodes
+                    .iter()
+                    .position(|selected| *selected == node)
+                {
+                    state.rounding_nodes.remove(index);
+                } else {
+                    state.rounding_nodes.push(node);
+                }
+                state.set_status(
+                    StatusLevel::Info,
+                    format!(
+                        "{} corner(s) selected for rounding",
+                        state.rounding_nodes.len()
+                    ),
+                );
+            } else {
+                state.set_status(
+                    StatusLevel::Warning,
+                    "Click a corner node on a selected straight-line shape",
+                );
+            }
+        }
+        return;
+    }
+
     if state.canvas_tool == CanvasTool::Line {
         if response.clicked_by(PointerButton::Primary)
             && let Some(pos) = response.interact_pointer_pos()
@@ -165,7 +199,7 @@ fn handle_tool_input(ui: &egui::Ui, response: &egui::Response, state: &mut AppSt
     {
         state.interaction = match state.canvas_tool {
             CanvasTool::Select => begin_drag(state, world(press), shift),
-            CanvasTool::EditNodes => begin_node_drag(state, world(press)),
+            CanvasTool::EditNodes => begin_node_drag(state, world(press), shift),
             tool => Interaction::DrawShape {
                 tool,
                 start: world(press),
@@ -183,7 +217,7 @@ fn handle_tool_input(ui: &egui::Ui, response: &egui::Response, state: &mut AppSt
     {
         match state.canvas_tool {
             CanvasTool::Select => click_select(state, world(pos), shift),
-            CanvasTool::EditNodes => select_node_at(state, world(pos)),
+            CanvasTool::EditNodes => select_node_at(state, world(pos), shift),
             _ => {}
         }
     }
@@ -191,6 +225,24 @@ fn handle_tool_input(ui: &egui::Ui, response: &egui::Response, state: &mut AppSt
 
 fn handle_keys(ui: &egui::Ui, state: &mut AppState) {
     if ui.memory(|m| m.focused().is_some()) {
+        return;
+    }
+    if state.canvas_tool == CanvasTool::RoundCorners {
+        let (escape, apply) = ui.input(|i| {
+            (
+                i.key_pressed(egui::Key::Escape),
+                i.key_pressed(egui::Key::Enter),
+            )
+        });
+        if escape {
+            state.rounding_nodes.clear();
+            state.canvas_tool = CanvasTool::Select;
+            state.set_status(StatusLevel::Info, "Corner rounding cancelled");
+        } else if apply {
+            crate::modifiers::apply_selected_corners(state);
+            state.rounding_nodes.clear();
+            state.canvas_tool = CanvasTool::Select;
+        }
         return;
     }
     if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
@@ -208,12 +260,71 @@ fn handle_keys(ui: &egui::Ui, state: &mut AppState) {
         if state.interaction == Interaction::Idle {
             state.selection.clear();
             state.selected_node = None;
+            state.selected_nodes.clear();
+            state.selected_segment = None;
+            state.selected_segment_point = None;
         } else {
             state.interaction = Interaction::Idle;
         }
     }
     if state.interaction != Interaction::Idle {
         return;
+    }
+    if state.canvas_tool == CanvasTool::EditNodes {
+        let action = ui.input(|input| {
+            [
+                (egui::Key::S, NodeEditAction::Smooth),
+                (egui::Key::L, NodeEditAction::ToLine),
+                (egui::Key::C, NodeEditAction::Corner),
+                (egui::Key::D, NodeEditAction::Delete),
+                (egui::Key::I, NodeEditAction::InsertAtPointer),
+                (egui::Key::M, NodeEditAction::InsertMidpoint),
+                (egui::Key::B, NodeEditAction::Break),
+                (egui::Key::T, NodeEditAction::Trim),
+                (egui::Key::E, NodeEditAction::Extend),
+            ]
+            .into_iter()
+            .find_map(|(key, action)| input.key_pressed(key).then_some(action))
+        });
+        if let Some(action) = action {
+            apply_node_edit_action(state, action);
+            return;
+        }
+        if ui.input(|input| input.key_pressed(egui::Key::A)) {
+            let points: Vec<Point> = state
+                .selected_nodes
+                .iter()
+                .filter_map(|node| {
+                    state.document.shape(node.shape_id).and_then(|shape| {
+                        let path = editable_path(&shape.world_path());
+                        path.subpaths()
+                            .get(node.subpath)
+                            .and_then(|subpath| anchor_point(subpath, node.anchor))
+                    })
+                })
+                .collect();
+            let horizontal = points.len() < 2 || {
+                let min_x = points
+                    .iter()
+                    .map(|point| point.x)
+                    .fold(f64::INFINITY, f64::min);
+                let max_x = points
+                    .iter()
+                    .map(|point| point.x)
+                    .fold(f64::NEG_INFINITY, f64::max);
+                let min_y = points
+                    .iter()
+                    .map(|point| point.y)
+                    .fold(f64::INFINITY, f64::min);
+                let max_y = points
+                    .iter()
+                    .map(|point| point.y)
+                    .fold(f64::NEG_INFINITY, f64::max);
+                max_x - min_x >= max_y - min_y
+            };
+            align_selected_nodes(state, horizontal);
+            return;
+        }
     }
     if ui.input(|i| i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace)) {
         actions::delete_selection(state);
@@ -292,7 +403,19 @@ fn begin_drag(state: &mut AppState, press: Point, shift: bool) -> Interaction {
     }
 }
 
-fn begin_node_drag(state: &mut AppState, press: Point) -> Interaction {
+fn begin_node_drag(state: &mut AppState, press: Point, shift: bool) -> Interaction {
+    if let Some(node) = state.selected_node
+        && let Some((handle, point, opposite, smooth)) =
+            nearest_node_control_handle(state, node, press)
+    {
+        let anchor = selected_node_point(state, node).unwrap_or(point);
+        return Interaction::MoveNodeHandle {
+            handle: NodeHandleRef { node, side: handle },
+            pointer_offset: Vec2::new(point.x - press.x, point.y - press.y),
+            opposite_length: opposite.map(|point| point.distance(anchor)),
+            smooth,
+        };
+    }
     let Some(node) = nearest_editable_node(state, press) else {
         if let Some(id) = pick_shape(
             &state.document,
@@ -302,28 +425,971 @@ fn begin_node_drag(state: &mut AppState, press: Point) -> Interaction {
             state.selection = vec![id];
         }
         state.selected_node = None;
+        state.selected_nodes.clear();
+        state.selected_segment = nearest_editable_segment(state, press);
+        state.selected_segment_point = state.selected_segment.map(|_| press);
         return Interaction::Idle;
     };
-    state.selection = vec![node.shape_id];
-    state.selected_node = Some(node);
+    if !shift {
+        state.selection = vec![node.shape_id];
+    } else if !state.selection.contains(&node.shape_id) {
+        state.selection.push(node.shape_id);
+    }
+    if shift {
+        if state
+            .selected_nodes
+            .first()
+            .is_some_and(|selected| selected.shape_id != node.shape_id)
+        {
+            state.selected_nodes.clear();
+        }
+        if !state.selected_nodes.contains(&node) {
+            state.selected_nodes.push(node);
+        }
+        state.selected_node = Some(node);
+    } else if !state.selected_nodes.contains(&node) || state.selected_nodes.len() <= 1 {
+        state.selected_nodes.clear();
+        state.selected_nodes.push(node);
+        state.selected_node = Some(node);
+    }
+    state.selected_segment = None;
+    state.selected_segment_point = None;
+    if state.selected_node.is_none() {
+        state.selected_node = Some(node);
+    }
     Interaction::MoveNode { node, start: press }
 }
 
-fn select_node_at(state: &mut AppState, at: Point) {
+fn select_node_at(state: &mut AppState, at: Point, shift: bool) {
     if let Some(node) = nearest_editable_node(state, at) {
-        state.selection = vec![node.shape_id];
-        state.selected_node = Some(node);
+        if !shift {
+            state.selection = vec![node.shape_id];
+            state.selected_nodes.clear();
+        } else if !state.selection.contains(&node.shape_id) {
+            state.selection.push(node.shape_id);
+        }
+        if shift {
+            if state
+                .selected_nodes
+                .first()
+                .is_some_and(|selected| selected.shape_id != node.shape_id)
+            {
+                state.selected_nodes.clear();
+            }
+            if !state.selected_nodes.contains(&node) {
+                state.selected_nodes.push(node);
+            }
+            state.selected_node = Some(node);
+        } else {
+            state.selected_nodes = vec![node];
+            state.selected_node = Some(node);
+        }
+        state.selected_segment = None;
+        state.selected_segment_point = None;
     } else {
         state.selected_node = None;
-        if let Some(id) = pick_shape(
+        state.selected_nodes.clear();
+        if let Some(segment) = nearest_editable_segment(state, at) {
+            if !shift || !state.selection.contains(&segment.shape_id) {
+                state.selection = vec![segment.shape_id];
+            }
+            state.selected_segment = Some(segment);
+            state.selected_segment_point = Some(at);
+        } else if let Some(id) = pick_shape(
             &state.document,
             at,
             PICK_TOLERANCE_PX / state.viewport.zoom(),
         ) {
             state.selection = vec![id];
+            state.selected_segment = None;
+            state.selected_segment_point = None;
         } else {
             state.selection.clear();
+            state.selected_segment = None;
+            state.selected_segment_point = None;
         }
+    }
+}
+
+fn nearest_editable_segment(state: &AppState, at: Point) -> Option<SegmentRef> {
+    let tolerance = PICK_TOLERANCE_PX / state.viewport.zoom();
+    let selected: HashSet<ShapeId> = state.selection.iter().copied().collect();
+    let mut closest: Option<(SegmentRef, f64)> = None;
+    for shape in state
+        .document
+        .shapes()
+        .iter()
+        .filter(|shape| selected.is_empty() || selected.contains(&shape.id))
+    {
+        let path = editable_path(&shape.world_path());
+        for (subpath_index, subpath) in path.subpaths().iter().enumerate() {
+            for (segment_index, segment) in subpath.segments().iter().enumerate() {
+                let distance = (0..=32)
+                    .map(|step| segment.point_at(f64::from(step) / 32.0).distance(at))
+                    .fold(f64::INFINITY, f64::min);
+                if distance <= tolerance && closest.map_or(true, |(_, best)| distance < best) {
+                    closest = Some((
+                        SegmentRef {
+                            shape_id: shape.id,
+                            subpath: subpath_index,
+                            segment: segment_index,
+                        },
+                        distance,
+                    ));
+                }
+            }
+        }
+    }
+    closest.map(|(segment, _)| segment)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NodeEditAction {
+    Smooth,
+    ToLine,
+    Corner,
+    Delete,
+    InsertAtPointer,
+    InsertMidpoint,
+    Break,
+    Trim,
+    Extend,
+    AlignHorizontal,
+    AlignVertical,
+}
+
+/// Context menu shared by the Edit Nodes tool and the Edit menu.
+pub fn show_node_editor_menu(ui: &mut egui::Ui, state: &mut AppState) {
+    ui.label("Edit Nodes");
+    ui.separator();
+    let node_selected = state.selected_node.is_some();
+    let segment_selected = state.selected_segment.is_some();
+    let insert_target = segment_selected
+        || state
+            .cursor_mm
+            .is_some_and(|point| nearest_editable_segment(state, point).is_some());
+    for (label, action, enabled) in [
+        (
+            "Smooth node or line (S)",
+            NodeEditAction::Smooth,
+            node_selected || segment_selected,
+        ),
+        (
+            "Convert curve to line (L)",
+            NodeEditAction::ToLine,
+            segment_selected,
+        ),
+        (
+            "Convert node to corner (C)",
+            NodeEditAction::Corner,
+            node_selected,
+        ),
+        (
+            "Delete node or line (D)",
+            NodeEditAction::Delete,
+            node_selected || segment_selected,
+        ),
+        (
+            "Insert node point (I)",
+            NodeEditAction::InsertAtPointer,
+            insert_target,
+        ),
+        (
+            "Insert node at midpoint (M)",
+            NodeEditAction::InsertMidpoint,
+            segment_selected,
+        ),
+        (
+            "Break shape at point (B)",
+            NodeEditAction::Break,
+            node_selected,
+        ),
+        ("Trim line (T)", NodeEditAction::Trim, segment_selected),
+        ("Extend line (E)", NodeEditAction::Extend, segment_selected),
+    ] {
+        if ui.add_enabled(enabled, egui::Button::new(label)).clicked() {
+            apply_node_edit_action(state, action);
+            ui.close();
+        }
+    }
+    ui.add_enabled_ui(state.selected_nodes.len() > 1, |ui| {
+        ui.menu_button("Align selected (A)", |ui| {
+            if ui.button("Align horizontally").clicked() {
+                apply_node_edit_action(state, NodeEditAction::AlignHorizontal);
+                ui.close();
+            }
+            if ui.button("Align vertically").clicked() {
+                apply_node_edit_action(state, NodeEditAction::AlignVertical);
+                ui.close();
+            }
+        })
+    });
+}
+
+fn apply_node_edit_action(state: &mut AppState, action: NodeEditAction) {
+    let segment_ref = if matches!(action, NodeEditAction::InsertAtPointer) {
+        state
+            .cursor_mm
+            .and_then(|point| nearest_editable_segment(state, point))
+            .or(state.selected_segment)
+    } else {
+        state.selected_segment
+    };
+    match action {
+        NodeEditAction::InsertAtPointer | NodeEditAction::InsertMidpoint => {
+            let Some(segment_ref) = segment_ref else {
+                return;
+            };
+            let Some(shape) = state.document.shape(segment_ref.shape_id) else {
+                return;
+            };
+            let path = editable_path(&shape.world_path());
+            let Some(segment) = path
+                .subpaths()
+                .get(segment_ref.subpath)
+                .and_then(|subpath| subpath.segments().get(segment_ref.segment))
+                .copied()
+            else {
+                return;
+            };
+            let t = if action == NodeEditAction::InsertMidpoint {
+                0.5
+            } else {
+                state
+                    .cursor_mm
+                    .or(state.selected_segment_point)
+                    .map_or(0.5, |point| nearest_parameter(segment, point))
+            };
+            if let Some(path) = insert_path_node(&path, segment_ref.subpath, segment_ref.segment, t)
+            {
+                let inserted_anchor = if path.subpaths()[segment_ref.subpath].is_closed()
+                    && segment_ref.segment + 1
+                        == path.subpaths()[segment_ref.subpath].segments().len()
+                {
+                    0
+                } else {
+                    segment_ref.segment + 1
+                };
+                actions::set_shape_geometry(
+                    state,
+                    segment_ref.shape_id,
+                    ShapeKind::Path(path),
+                    Transform::identity(),
+                );
+                state.selected_node = Some(NodeRef {
+                    shape_id: segment_ref.shape_id,
+                    subpath: segment_ref.subpath,
+                    anchor: inserted_anchor,
+                });
+                state.selected_nodes = state.selected_node.into_iter().collect();
+                state.selected_segment = None;
+                state.selected_segment_point = None;
+            }
+        }
+        NodeEditAction::ToLine | NodeEditAction::Trim | NodeEditAction::Extend => {
+            let Some(segment_ref) = segment_ref else {
+                return;
+            };
+            edit_selected_segment(state, segment_ref, action);
+        }
+        NodeEditAction::Delete => {
+            if let Some(node) = state.selected_node {
+                delete_path_node(state, node);
+            } else if let Some(segment) = segment_ref {
+                delete_path_segment(state, segment);
+            }
+        }
+        NodeEditAction::Smooth | NodeEditAction::Corner | NodeEditAction::Break => {
+            if let Some(node) = state.selected_node {
+                edit_selected_node(state, node, action);
+            } else if action == NodeEditAction::Smooth
+                && let Some(segment) = segment_ref
+            {
+                edit_selected_segment(state, segment, NodeEditAction::Smooth);
+            }
+        }
+        NodeEditAction::AlignHorizontal | NodeEditAction::AlignVertical => {
+            align_selected_nodes(state, action == NodeEditAction::AlignHorizontal);
+        }
+    }
+}
+
+fn nearest_parameter(segment: Segment, point: Point) -> f64 {
+    let coarse = (0..=100)
+        .map(|step| f64::from(step) / 100.0)
+        .min_by(|a, b| {
+            segment
+                .point_at(*a)
+                .distance(point)
+                .total_cmp(&segment.point_at(*b).distance(point))
+        })
+        .unwrap_or(0.5);
+    let mut low = (coarse - 0.01).max(0.0);
+    let mut high = (coarse + 0.01).min(1.0);
+    for _ in 0..20 {
+        let left = low + (high - low) / 3.0;
+        let right = high - (high - low) / 3.0;
+        if segment.point_at(left).distance(point) <= segment.point_at(right).distance(point) {
+            high = right;
+        } else {
+            low = left;
+        }
+    }
+    (low + high) / 2.0
+}
+
+fn split_segment(segment: Segment, t: f64) -> (Segment, Segment) {
+    match segment {
+        Segment::Line { from, to } => {
+            let mid = from.lerp(to, t);
+            (
+                Segment::Line { from, to: mid },
+                Segment::Line { from: mid, to },
+            )
+        }
+        Segment::QuadBezier { from, ctrl, to } => {
+            let a = from.lerp(ctrl, t);
+            let b = ctrl.lerp(to, t);
+            let mid = a.lerp(b, t);
+            (
+                Segment::QuadBezier {
+                    from,
+                    ctrl: a,
+                    to: mid,
+                },
+                Segment::QuadBezier {
+                    from: mid,
+                    ctrl: b,
+                    to,
+                },
+            )
+        }
+        Segment::CubicBezier {
+            from,
+            ctrl1,
+            ctrl2,
+            to,
+        } => {
+            let a = from.lerp(ctrl1, t);
+            let b = ctrl1.lerp(ctrl2, t);
+            let c = ctrl2.lerp(to, t);
+            let d = a.lerp(b, t);
+            let e = b.lerp(c, t);
+            let mid = d.lerp(e, t);
+            (
+                Segment::CubicBezier {
+                    from,
+                    ctrl1: a,
+                    ctrl2: d,
+                    to: mid,
+                },
+                Segment::CubicBezier {
+                    from: mid,
+                    ctrl1: e,
+                    ctrl2: c,
+                    to,
+                },
+            )
+        }
+        Segment::Arc {
+            center,
+            radii,
+            x_rotation,
+            start_angle,
+            sweep_angle,
+        } => (
+            Segment::Arc {
+                center,
+                radii,
+                x_rotation,
+                start_angle,
+                sweep_angle: sweep_angle * t,
+            },
+            Segment::Arc {
+                center,
+                radii,
+                x_rotation,
+                start_angle: start_angle + sweep_angle * t,
+                sweep_angle: sweep_angle * (1.0 - t),
+            },
+        ),
+    }
+}
+
+fn insert_path_node(
+    path: &Path,
+    subpath_index: usize,
+    segment_index: usize,
+    t: f64,
+) -> Option<Path> {
+    let mut subpaths = path.subpaths().to_vec();
+    let subpath = subpaths.get_mut(subpath_index)?;
+    let mut segments = subpath.segments().to_vec();
+    let (first, second) = split_segment(*segments.get(segment_index)?, t.clamp(1e-6, 1.0 - 1e-6));
+    segments[segment_index] = first;
+    segments.insert(segment_index + 1, second);
+    if subpath.is_closed() && segment_index + 1 == segments.len() - 1 {
+        segments.rotate_left(segment_index + 1);
+    }
+    *subpath = SubPath::new(segments, subpath.is_closed()).ok()?;
+    Some(Path::new(subpaths))
+}
+
+fn as_cubic(segment: Segment) -> Segment {
+    match segment {
+        Segment::Line { from, to } => Segment::CubicBezier {
+            from,
+            ctrl1: from.lerp(to, 1.0 / 3.0),
+            ctrl2: from.lerp(to, 2.0 / 3.0),
+            to,
+        },
+        Segment::QuadBezier { from, ctrl, to } => Segment::CubicBezier {
+            from,
+            ctrl1: from.lerp(ctrl, 2.0 / 3.0),
+            ctrl2: to.lerp(ctrl, 2.0 / 3.0),
+            to,
+        },
+        other => other,
+    }
+}
+
+fn edit_selected_segment(state: &mut AppState, reference: SegmentRef, action: NodeEditAction) {
+    let Some(shape) = state.document.shape(reference.shape_id) else {
+        return;
+    };
+    let mut path = editable_path(&shape.world_path());
+    let Some(subpath) = path.subpaths().get(reference.subpath) else {
+        return;
+    };
+    let Some(segment) = subpath.segments().get(reference.segment).copied() else {
+        return;
+    };
+    let replacement = match action {
+        NodeEditAction::Smooth => Some(as_cubic(segment)),
+        NodeEditAction::ToLine => Some(Segment::Line {
+            from: segment.start(),
+            to: segment.end(),
+        }),
+        NodeEditAction::Trim | NodeEditAction::Extend => {
+            if !matches!(segment, Segment::Line { .. }) {
+                return;
+            }
+            let Some(pointer) = state.cursor_mm.or(state.selected_segment_point) else {
+                return;
+            };
+            let trim_start = pointer.distance(segment.start()) < pointer.distance(segment.end());
+            let intersections = line_intersections(state, reference, segment);
+            let parameter = if action == NodeEditAction::Trim {
+                if trim_start {
+                    intersections
+                        .into_iter()
+                        .filter(|t| *t > 0.0 && *t < 1.0)
+                        .min_by(f64::total_cmp)
+                } else {
+                    intersections
+                        .into_iter()
+                        .filter(|t| *t > 0.0 && *t < 1.0)
+                        .max_by(f64::total_cmp)
+                }
+            } else if trim_start {
+                intersections
+                    .into_iter()
+                    .filter(|t| *t < 0.0)
+                    .max_by(f64::total_cmp)
+            } else {
+                intersections
+                    .into_iter()
+                    .filter(|t| *t > 1.0)
+                    .min_by(f64::total_cmp)
+            };
+            let Some(t) = parameter else {
+                state.set_status(
+                    crate::state::StatusLevel::Info,
+                    "No line intersection found",
+                );
+                return;
+            };
+            let new_anchor = if trim_start {
+                reference.segment
+            } else {
+                reference.segment + 1
+            };
+            let point = segment.point_at(t);
+            move_path_anchor(
+                &path,
+                reference.subpath,
+                new_anchor,
+                Vec2::new(
+                    point.x
+                        - if trim_start {
+                            segment.start().x
+                        } else {
+                            segment.end().x
+                        },
+                    point.y
+                        - if trim_start {
+                            segment.start().y
+                        } else {
+                            segment.end().y
+                        },
+                ),
+            )
+            .map(|updated| {
+                path = updated;
+                segment
+            })
+        }
+        _ => None,
+    };
+    if action == NodeEditAction::ToLine || action == NodeEditAction::Smooth {
+        let mut subpaths = path.subpaths().to_vec();
+        if let Some(subpath) = subpaths.get_mut(reference.subpath) {
+            let mut segments = subpath.segments().to_vec();
+            if reference.segment < segments.len() {
+                segments[reference.segment] = replacement.unwrap();
+                if let Ok(updated) = SubPath::new(segments, subpath.is_closed()) {
+                    *subpath = updated;
+                }
+            }
+        }
+        path = Path::new(subpaths);
+    } else if replacement.is_none() {
+        return;
+    }
+    actions::set_shape_geometry(
+        state,
+        reference.shape_id,
+        ShapeKind::Path(path),
+        Transform::identity(),
+    );
+}
+
+fn line_intersections(state: &AppState, target_ref: SegmentRef, target: Segment) -> Vec<f64> {
+    let Segment::Line { from, to } = target else {
+        return Vec::new();
+    };
+    let r = Vec2::new(to.x - from.x, to.y - from.y);
+    let mut intersections = Vec::new();
+    for shape in state.document.shapes() {
+        let path = editable_path(&shape.world_path());
+        for (subpath_index, subpath) in path.subpaths().iter().enumerate() {
+            for (segment_index, segment) in subpath.segments().iter().enumerate() {
+                if shape.id == target_ref.shape_id
+                    && subpath_index == target_ref.subpath
+                    && segment_index == target_ref.segment
+                {
+                    continue;
+                }
+                let samples = match segment {
+                    Segment::Line { .. } => 1,
+                    _ => 24,
+                };
+                for sample in 0..samples {
+                    let a = segment.point_at(f64::from(sample) / f64::from(samples));
+                    let b = segment.point_at(f64::from(sample + 1) / f64::from(samples));
+                    let s = Vec2::new(b.x - a.x, b.y - a.y);
+                    let denom = cross(r, s);
+                    if denom.abs() < 1e-12 {
+                        continue;
+                    }
+                    let q = Vec2::new(a.x - from.x, a.y - from.y);
+                    let t = cross(q, s) / denom;
+                    let u = cross(q, r) / denom;
+                    if (-1e-9..=1.0 + 1e-9).contains(&u)
+                        && !intersections
+                            .iter()
+                            .any(|found: &f64| (*found - t).abs() < 1e-7)
+                    {
+                        intersections.push(t);
+                    }
+                }
+            }
+        }
+    }
+    intersections
+}
+
+fn cross(a: Vec2, b: Vec2) -> f64 {
+    a.x * b.y - a.y * b.x
+}
+
+fn edit_selected_node(state: &mut AppState, node: NodeRef, action: NodeEditAction) {
+    let Some(shape) = state.document.shape(node.shape_id) else {
+        return;
+    };
+    let mut path = editable_path(&shape.world_path());
+    let Some(subpath) = path.subpaths().get(node.subpath) else {
+        return;
+    };
+    let closed = subpath.is_closed();
+    let segments = subpath.segments().to_vec();
+    let count = segments.len();
+    if count == 0 {
+        return;
+    }
+    let anchor_count = count + if closed { 0 } else { 1 };
+    if node.anchor >= anchor_count {
+        return;
+    }
+    let current = (node.anchor < count).then_some(node.anchor);
+    let previous = if node.anchor > 0 {
+        Some(node.anchor - 1)
+    } else if closed {
+        Some(count - 1)
+    } else {
+        None
+    };
+    let mut changed = false;
+    match action {
+        NodeEditAction::Smooth | NodeEditAction::Corner => {
+            let anchor = current
+                .map(|index| segments[index].start())
+                .or_else(|| previous.map(|index| segments[index].end()))
+                .unwrap();
+            let mut updated = segments;
+            if let Some(index) = previous {
+                let Segment::CubicBezier {
+                    from,
+                    ctrl1,
+                    ctrl2: _,
+                    to,
+                } = as_cubic(updated[index])
+                else {
+                    return;
+                };
+                if action == NodeEditAction::Corner {
+                    updated[index] = Segment::CubicBezier {
+                        from,
+                        ctrl1,
+                        ctrl2: anchor,
+                        to,
+                    };
+                } else if let Some(next) = current {
+                    let Segment::CubicBezier {
+                        from: next_from,
+                        ctrl1: _,
+                        ctrl2,
+                        to: next_to,
+                    } = as_cubic(updated[next])
+                    else {
+                        return;
+                    };
+                    let tangent = Vec2::new(next_to.x - from.x, next_to.y - from.y);
+                    let length = tangent.x.hypot(tangent.y);
+                    if length <= 1e-12 {
+                        return;
+                    }
+                    let direction = Vec2::new(tangent.x / length, tangent.y / length);
+                    let incoming = from.distance(anchor) / 3.0;
+                    let outgoing = anchor.distance(next_to) / 3.0;
+                    updated[index] = Segment::CubicBezier {
+                        from,
+                        ctrl1,
+                        ctrl2: Point::new(
+                            anchor.x - direction.x * incoming,
+                            anchor.y - direction.y * incoming,
+                        ),
+                        to,
+                    };
+                    updated[next] = Segment::CubicBezier {
+                        from: next_from,
+                        ctrl1: Point::new(
+                            anchor.x + direction.x * outgoing,
+                            anchor.y + direction.y * outgoing,
+                        ),
+                        ctrl2,
+                        to: next_to,
+                    };
+                } else {
+                    updated[index] = as_cubic(updated[index]);
+                }
+            } else if action == NodeEditAction::Smooth
+                && let Some(index) = current
+            {
+                updated[index] = as_cubic(updated[index]);
+            }
+            if let Some(index) = current
+                && action == NodeEditAction::Corner
+            {
+                if let Segment::CubicBezier {
+                    from,
+                    ctrl1: _,
+                    ctrl2,
+                    to,
+                } = as_cubic(updated[index])
+                {
+                    updated[index] = Segment::CubicBezier {
+                        from,
+                        ctrl1: anchor,
+                        ctrl2,
+                        to,
+                    };
+                }
+            }
+            if let Ok(subpath) = SubPath::new(updated, closed) {
+                let mut subpaths = path.subpaths().to_vec();
+                subpaths[node.subpath] = subpath;
+                path = Path::new(subpaths);
+                changed = true;
+            }
+        }
+        NodeEditAction::Break => {
+            if closed {
+                if let Ok(open) = SubPath::new(segments, false) {
+                    let mut subpaths = path.subpaths().to_vec();
+                    subpaths[node.subpath] = open;
+                    path = Path::new(subpaths);
+                    changed = true;
+                }
+            } else if node.anchor > 0 && node.anchor < count {
+                let left = SubPath::new(segments[..node.anchor].to_vec(), false).ok();
+                let right = SubPath::new(segments[node.anchor..].to_vec(), false).ok();
+                if let (Some(left), Some(right)) = (left, right) {
+                    let mut subpaths = path.subpaths().to_vec();
+                    subpaths.splice(node.subpath..=node.subpath, [left, right]);
+                    path = Path::new(subpaths);
+                    changed = true;
+                }
+            }
+        }
+        _ => return,
+    }
+    if changed {
+        actions::set_shape_geometry(
+            state,
+            node.shape_id,
+            ShapeKind::Path(path),
+            Transform::identity(),
+        );
+        state.selected_node = None;
+        state.selected_nodes.clear();
+    }
+}
+
+fn delete_path_node(state: &mut AppState, node: NodeRef) {
+    let Some(shape) = state.document.shape(node.shape_id) else {
+        return;
+    };
+    let path = editable_path(&shape.world_path());
+    let Some(subpath) = path.subpaths().get(node.subpath) else {
+        return;
+    };
+    let mut segments = subpath.segments().to_vec();
+    let count = segments.len();
+    let anchor_count = count + if subpath.is_closed() { 0 } else { 1 };
+    if node.anchor >= anchor_count || count == 0 {
+        return;
+    }
+    if count == 1 && !subpath.is_closed() {
+        delete_path_segment(
+            state,
+            SegmentRef {
+                shape_id: node.shape_id,
+                subpath: node.subpath,
+                segment: 0,
+            },
+        );
+        return;
+    }
+    if count < 2 {
+        return;
+    }
+    if subpath.is_closed() {
+        let previous = (node.anchor + count - 1) % count;
+        let current = node.anchor % count;
+        let from = segments[previous].start();
+        let to = segments[current].end();
+        let prev = as_cubic(segments[previous]);
+        let next = as_cubic(segments[current]);
+        let (ctrl1, ctrl2) = match (prev, next) {
+            (Segment::CubicBezier { ctrl1, .. }, Segment::CubicBezier { ctrl2, .. }) => {
+                (ctrl1, ctrl2)
+            }
+            _ => (from.lerp(to, 1.0 / 3.0), from.lerp(to, 2.0 / 3.0)),
+        };
+        let merged = Segment::CubicBezier {
+            from,
+            ctrl1,
+            ctrl2,
+            to,
+        };
+        if node.anchor == 0 {
+            segments[count - 1] = merged;
+            segments.remove(0);
+        } else {
+            segments[current] = merged;
+            segments.remove(previous);
+        }
+        if let Ok(updated) = SubPath::new(segments, true) {
+            let mut subpaths = path.subpaths().to_vec();
+            subpaths[node.subpath] = updated;
+            actions::set_shape_geometry(
+                state,
+                node.shape_id,
+                ShapeKind::Path(Path::new(subpaths)),
+                Transform::identity(),
+            );
+        }
+    } else if node.anchor == 0 || node.anchor == count {
+        segments.remove(if node.anchor == 0 { 0 } else { count - 1 });
+        if let Ok(updated) = SubPath::new(segments, false) {
+            let mut subpaths = path.subpaths().to_vec();
+            subpaths[node.subpath] = updated;
+            actions::set_shape_geometry(
+                state,
+                node.shape_id,
+                ShapeKind::Path(Path::new(subpaths)),
+                Transform::identity(),
+            );
+        }
+    } else {
+        let previous = segments[node.anchor - 1];
+        let next = segments[node.anchor];
+        let from = previous.start();
+        let to = next.end();
+        let (ctrl1, ctrl2) = match (as_cubic(previous), as_cubic(next)) {
+            (Segment::CubicBezier { ctrl1, .. }, Segment::CubicBezier { ctrl2, .. }) => {
+                (ctrl1, ctrl2)
+            }
+            _ => (from.lerp(to, 1.0 / 3.0), from.lerp(to, 2.0 / 3.0)),
+        };
+        segments[node.anchor - 1] = Segment::CubicBezier {
+            from,
+            ctrl1,
+            ctrl2,
+            to,
+        };
+        segments.remove(node.anchor);
+        if let Ok(updated) = SubPath::new(segments, false) {
+            let mut subpaths = path.subpaths().to_vec();
+            subpaths[node.subpath] = updated;
+            actions::set_shape_geometry(
+                state,
+                node.shape_id,
+                ShapeKind::Path(Path::new(subpaths)),
+                Transform::identity(),
+            );
+        }
+    }
+    state.selected_node = None;
+    state.selected_nodes.clear();
+}
+
+fn delete_path_segment(state: &mut AppState, reference: SegmentRef) {
+    let Some(shape) = state.document.shape(reference.shape_id) else {
+        return;
+    };
+    let path = editable_path(&shape.world_path());
+    let Some(subpath) = path.subpaths().get(reference.subpath) else {
+        return;
+    };
+    let segments = subpath.segments();
+    if reference.segment >= segments.len() {
+        return;
+    }
+    let mut subpaths = path.subpaths().to_vec();
+    if subpath.is_closed() {
+        let mut remaining = segments[reference.segment + 1..].to_vec();
+        remaining.extend_from_slice(&segments[..reference.segment]);
+        if remaining.is_empty() {
+            subpaths.remove(reference.subpath);
+        } else {
+            let Ok(open) = SubPath::new(remaining, false) else {
+                return;
+            };
+            subpaths[reference.subpath] = open;
+        }
+    } else {
+        let left = SubPath::new(segments[..reference.segment].to_vec(), false).ok();
+        let right = SubPath::new(segments[reference.segment + 1..].to_vec(), false).ok();
+        let mut replacements = Vec::new();
+        replacements.extend(left);
+        replacements.extend(right);
+        subpaths.splice(reference.subpath..=reference.subpath, replacements);
+    }
+    if subpaths.is_empty() {
+        actions::delete_shape(state, reference.shape_id);
+    } else {
+        actions::set_shape_geometry(
+            state,
+            reference.shape_id,
+            ShapeKind::Path(Path::new(subpaths)),
+            Transform::identity(),
+        );
+    }
+    state.selected_node = None;
+    state.selected_nodes.clear();
+    state.selected_segment = None;
+    state.selected_segment_point = None;
+}
+
+fn align_selected_nodes(state: &mut AppState, horizontal: bool) {
+    let mut nodes = state.selected_nodes.clone();
+    if let Some(active) = state.selected_node
+        && !nodes.contains(&active)
+    {
+        nodes.push(active);
+    }
+    if nodes.len() < 2 {
+        return;
+    }
+    let Some(primary) = state.selected_node.or(nodes.first().copied()) else {
+        return;
+    };
+    let Some(shape) = state.document.shape(primary.shape_id) else {
+        return;
+    };
+    let path = editable_path(&shape.world_path());
+    let Some(subpath) = path.subpaths().get(primary.subpath) else {
+        return;
+    };
+    let Some(anchor) = anchor_point(subpath, primary.anchor) else {
+        return;
+    };
+    let shape_ids: HashSet<ShapeId> = nodes.iter().map(|node| node.shape_id).collect();
+    for shape_id in shape_ids {
+        let Some(shape) = state.document.shape(shape_id) else {
+            continue;
+        };
+        let mut updated = editable_path(&shape.world_path());
+        for node in nodes.iter().filter(|node| node.shape_id == shape_id) {
+            let Some(current_subpath) = updated.subpaths().get(node.subpath) else {
+                continue;
+            };
+            let Some(current) = anchor_point(current_subpath, node.anchor) else {
+                continue;
+            };
+            let target = if horizontal {
+                Point::new(current.x, anchor.y)
+            } else {
+                Point::new(anchor.x, current.y)
+            };
+            if let Some(path) = move_path_anchor(
+                &updated,
+                node.subpath,
+                node.anchor,
+                Vec2::new(target.x - current.x, target.y - current.y),
+            ) {
+                updated = path;
+            }
+        }
+        actions::set_shape_geometry(
+            state,
+            shape_id,
+            ShapeKind::Path(updated),
+            Transform::identity(),
+        );
+    }
+}
+
+fn anchor_point(subpath: &SubPath, anchor: usize) -> Option<Point> {
+    let count = subpath.segments().len();
+    if anchor < count {
+        Some(subpath.segments()[anchor].start())
+    } else if !subpath.is_closed() && anchor == count {
+        Some(subpath.end())
+    } else {
+        None
     }
 }
 
@@ -357,6 +1423,227 @@ fn nearest_editable_node(state: &AppState, at: Point) -> Option<NodeRef> {
         }
     }
     closest.map(|(node, _)| node)
+}
+
+fn nearest_roundable_node(state: &AppState, at: Point) -> Option<NodeRef> {
+    let tolerance = HANDLE_HIT_PX / state.viewport.zoom();
+    let selected: HashSet<ShapeId> = state.selection.iter().copied().collect();
+    let mut closest: Option<(NodeRef, f64)> = None;
+    for shape in state
+        .document
+        .shapes()
+        .iter()
+        .filter(|shape| selected.contains(&shape.id))
+    {
+        let path = editable_path(&shape.world_path());
+        for (subpath_index, subpath) in path.subpaths().iter().enumerate() {
+            for anchor in roundable_anchors(subpath) {
+                let Some(point) = anchor_point(subpath, anchor) else {
+                    continue;
+                };
+                let distance = point.distance(at);
+                if distance <= tolerance && closest.map_or(true, |(_, d)| distance < d) {
+                    closest = Some((
+                        NodeRef {
+                            shape_id: shape.id,
+                            subpath: subpath_index,
+                            anchor,
+                        },
+                        distance,
+                    ));
+                }
+            }
+        }
+    }
+    closest.map(|(node, _)| node)
+}
+
+fn roundable_anchors(subpath: &SubPath) -> Vec<usize> {
+    let count = subpath.segments().len();
+    let anchors: Box<dyn Iterator<Item = usize>> = if subpath.is_closed() {
+        Box::new(0..count)
+    } else {
+        Box::new(1..count)
+    };
+    anchors
+        .filter(|&anchor| {
+            let previous = if anchor == 0 {
+                count.checked_sub(1)
+            } else {
+                Some(anchor - 1)
+            };
+            let next = (anchor < count).then_some(anchor);
+            let Some((previous, next)) = previous.zip(next) else {
+                return false;
+            };
+            let (
+                Segment::Line { from: p0, to: p1 },
+                Segment::Line {
+                    from: p1_next,
+                    to: p2,
+                },
+            ) = (subpath.segments()[previous], subpath.segments()[next])
+            else {
+                return false;
+            };
+            if p1.distance(p1_next) > 1e-6 {
+                return false;
+            }
+            let Some(incoming) = (p1 - p0).normalize() else {
+                return false;
+            };
+            let Some(outgoing) = (p2 - p1_next).normalize() else {
+                return false;
+            };
+            incoming.cross(outgoing).abs() > 1e-4 && incoming.dot(outgoing) > -0.9999
+        })
+        .collect()
+}
+
+fn selected_node_point(state: &AppState, node: NodeRef) -> Option<Point> {
+    let shape = state.document.shape(node.shape_id)?;
+    let path = editable_path(&shape.world_path());
+    let subpath = path.subpaths().get(node.subpath)?;
+    anchor_point(subpath, node.anchor)
+}
+
+fn node_control_points(
+    path: &Path,
+    node: NodeRef,
+) -> Option<(Point, Option<Point>, Option<Point>)> {
+    let subpath = path.subpaths().get(node.subpath)?;
+    let segments = subpath.segments();
+    let count = segments.len();
+    if count == 0 {
+        return None;
+    }
+    let anchor = anchor_point(subpath, node.anchor)?;
+    let current = (node.anchor < count).then_some(node.anchor);
+    let previous = if node.anchor > 0 {
+        Some(node.anchor - 1)
+    } else if subpath.is_closed() {
+        Some(count - 1)
+    } else {
+        None
+    };
+    let incoming = previous.and_then(|index| match segments[index] {
+        Segment::CubicBezier { ctrl2, .. } => Some(ctrl2),
+        _ => None,
+    });
+    let outgoing = current.and_then(|index| match segments[index] {
+        Segment::CubicBezier { ctrl1, .. } => Some(ctrl1),
+        _ => None,
+    });
+    Some((anchor, incoming, outgoing))
+}
+
+fn node_is_smooth(anchor: Point, incoming: Option<Point>, outgoing: Option<Point>) -> bool {
+    let (Some(incoming), Some(outgoing)) = (incoming, outgoing) else {
+        return false;
+    };
+    let a = Vec2::new(anchor.x - incoming.x, anchor.y - incoming.y);
+    let b = Vec2::new(outgoing.x - anchor.x, outgoing.y - anchor.y);
+    let lengths = a.x.hypot(a.y) * b.x.hypot(b.y);
+    lengths > 1e-12 && cross(a, b).abs() <= lengths * 1e-4 && a.x * b.x + a.y * b.y > 0.0
+}
+
+fn move_path_control(
+    path: &Path,
+    node: NodeRef,
+    side: NodeHandleSide,
+    target: Point,
+    opposite_length: Option<f64>,
+    linked: bool,
+) -> Option<Path> {
+    let mut subpaths = path.subpaths().to_vec();
+    let subpath = subpaths.get_mut(node.subpath)?;
+    let (anchor, _, _) = node_control_points(path, node)?;
+    let mut segments = subpath.segments().to_vec();
+    let count = segments.len();
+    let current = (node.anchor < count).then_some(node.anchor);
+    let previous = if node.anchor > 0 {
+        Some(node.anchor - 1)
+    } else if subpath.is_closed() {
+        Some(count - 1)
+    } else {
+        None
+    };
+    match side {
+        NodeHandleSide::Incoming => {
+            let index = previous?;
+            let Segment::CubicBezier { ctrl2, .. } = &mut segments[index] else {
+                return None;
+            };
+            *ctrl2 = target;
+        }
+        NodeHandleSide::Outgoing => {
+            let index = current?;
+            let Segment::CubicBezier { ctrl1, .. } = &mut segments[index] else {
+                return None;
+            };
+            *ctrl1 = target;
+        }
+    }
+    if linked && let Some(length) = opposite_length {
+        let vector = Vec2::new(target.x - anchor.x, target.y - anchor.y);
+        let magnitude = vector.x.hypot(vector.y);
+        let opposite = if magnitude > 1e-12 {
+            Point::new(
+                anchor.x - vector.x / magnitude * length,
+                anchor.y - vector.y / magnitude * length,
+            )
+        } else {
+            anchor
+        };
+        match side {
+            NodeHandleSide::Incoming => {
+                if let Some(index) = current
+                    && let Segment::CubicBezier { ctrl1, .. } = &mut segments[index]
+                {
+                    *ctrl1 = opposite;
+                }
+            }
+            NodeHandleSide::Outgoing => {
+                if let Some(index) = previous
+                    && let Segment::CubicBezier { ctrl2, .. } = &mut segments[index]
+                {
+                    *ctrl2 = opposite;
+                }
+            }
+        }
+    }
+    *subpath = SubPath::new(segments, subpath.is_closed()).ok()?;
+    Some(Path::new(subpaths))
+}
+
+fn nearest_node_control_handle(
+    state: &AppState,
+    node: NodeRef,
+    at: Point,
+) -> Option<(NodeHandleSide, Point, Option<Point>, bool)> {
+    let shape = state.document.shape(node.shape_id)?;
+    let path = editable_path(&shape.world_path());
+    let (anchor, incoming, outgoing) = node_control_points(&path, node)?;
+    let candidates = [
+        (NodeHandleSide::Incoming, incoming, outgoing),
+        (NodeHandleSide::Outgoing, outgoing, incoming),
+    ];
+    let tolerance = HANDLE_HIT_PX / state.viewport.zoom();
+    candidates
+        .into_iter()
+        .filter_map(|(side, point, opposite)| {
+            let point = point?;
+            let distance = point.distance(at);
+            (distance <= tolerance && distance > 1e-9).then_some((
+                side,
+                point,
+                opposite,
+                node_is_smooth(anchor, incoming, outgoing),
+                distance,
+            ))
+        })
+        .min_by(|a, b| a.4.total_cmp(&b.4))
+        .map(|(side, point, opposite, smooth, _)| (side, point, opposite, smooth))
 }
 
 fn editable_anchors(subpath: &SubPath) -> Vec<(usize, Point)> {
@@ -494,7 +1781,10 @@ fn finish_drag(state: &mut AppState, end: Point, shift: bool) {
                         regular_polygon(bounds, 5, true).map(ShapeKind::Polygon),
                         Transform::identity(),
                     ),
-                    CanvasTool::Select | CanvasTool::EditNodes | CanvasTool::Line => return,
+                    CanvasTool::Select
+                    | CanvasTool::EditNodes
+                    | CanvasTool::Line
+                    | CanvasTool::RoundCorners => return,
                 };
                 match kind {
                     Ok(kind) => actions::create_shape(state, kind, transform),
@@ -508,16 +1798,31 @@ fn finish_drag(state: &mut AppState, end: Point, shift: bool) {
         Interaction::MoveNode { node, start } => {
             let delta = move_delta(start, end);
             if !delta.is_identity() {
-                if let Some(shape) = state.document.shape(node.shape_id) {
-                    if let Some(path) = move_path_anchor(
-                        &editable_path(&shape.world_path()),
-                        node.subpath,
-                        node.anchor,
-                        Vec2::new(delta.e, delta.f),
-                    ) {
+                let nodes = if state.selected_nodes.contains(&node) {
+                    state.selected_nodes.clone()
+                } else {
+                    vec![node]
+                };
+                let shape_ids: HashSet<ShapeId> = nodes.iter().map(|node| node.shape_id).collect();
+                for shape_id in shape_ids {
+                    if let Some(shape) = state.document.shape(shape_id) {
+                        let mut path = editable_path(&shape.world_path());
+                        for selected in nodes
+                            .iter()
+                            .filter(|selected| selected.shape_id == shape_id)
+                        {
+                            if let Some(updated) = move_path_anchor(
+                                &path,
+                                selected.subpath,
+                                selected.anchor,
+                                Vec2::new(delta.e, delta.f),
+                            ) {
+                                path = updated;
+                            }
+                        }
                         actions::set_shape_geometry(
                             state,
-                            node.shape_id,
+                            shape_id,
                             ShapeKind::Path(path),
                             Transform::identity(),
                         );
@@ -525,6 +1830,33 @@ fn finish_drag(state: &mut AppState, end: Point, shift: bool) {
                 }
             }
             state.selected_node = Some(node);
+        }
+        Interaction::MoveNodeHandle {
+            handle,
+            pointer_offset,
+            opposite_length,
+            smooth,
+        } => {
+            let target = Point::new(end.x + pointer_offset.x, end.y + pointer_offset.y);
+            if let Some(shape) = state.document.shape(handle.node.shape_id) {
+                let path = editable_path(&shape.world_path());
+                if let Some(path) = move_path_control(
+                    &path,
+                    handle.node,
+                    handle.side,
+                    target,
+                    opposite_length,
+                    smooth,
+                ) {
+                    actions::set_shape_geometry(
+                        state,
+                        handle.node.shape_id,
+                        ShapeKind::Path(path),
+                        Transform::identity(),
+                    );
+                }
+            }
+            state.selected_node = Some(handle.node);
         }
         Interaction::Marquee { start } => {
             let mode = marquee_mode(start, end);
@@ -572,6 +1904,9 @@ fn should_close_line(state: &AppState, pointer: Point) -> bool {
 
 fn click_select(state: &mut AppState, at: Point, shift: bool) {
     state.selected_node = None;
+    state.selected_nodes.clear();
+    state.selected_segment = None;
+    state.selected_segment_point = None;
     let zoom = state.viewport.zoom();
     match pick_shape(&state.document, at, PICK_TOLERANCE_PX / zoom) {
         Some(id) if shift => {
@@ -593,7 +1928,8 @@ fn drag_delta(interaction: &Interaction, pointer: Point, shift: bool) -> Option<
         Interaction::Idle
         | Interaction::Marquee { .. }
         | Interaction::DrawShape { .. }
-        | Interaction::MoveNode { .. } => {
+        | Interaction::MoveNode { .. }
+        | Interaction::MoveNodeHandle { .. } => {
             return None;
         }
         Interaction::Move { start } => move_delta(start, pointer),
@@ -629,6 +1965,7 @@ fn cursor_for(state: &AppState, hover_px: Option<Point>) -> Option<CursorIcon> {
     match state.interaction {
         Interaction::DrawShape { .. } => return Some(CursorIcon::Crosshair),
         Interaction::MoveNode { .. } => return Some(CursorIcon::Grabbing),
+        Interaction::MoveNodeHandle { .. } => return Some(CursorIcon::Grabbing),
         Interaction::Move { .. } => return Some(CursorIcon::Grabbing),
         Interaction::Rotate { .. } => return Some(CursorIcon::Grabbing),
         Interaction::Scale { handle, .. } => return Some(resize_cursor(handle)),
@@ -637,6 +1974,11 @@ fn cursor_for(state: &AppState, hover_px: Option<Point>) -> Option<CursorIcon> {
     }
     let vp = &state.viewport;
     let at = vp.to_world(hover_px?);
+    if let Some(node) = state.selected_node
+        && nearest_node_control_handle(state, node, at).is_some()
+    {
+        return Some(CursorIcon::Grabbing);
+    }
     let bounds = display_bounds(state)?;
     let zoom = vp.zoom();
     match hit_handle(bounds, at, HANDLE_HIT_PX / zoom, ROTATE_OFFSET_PX / zoom) {
@@ -738,26 +2080,63 @@ fn draw_shape_preview(
             let points = radial_points(frame.center(), frame.size() / 2.0, 10, Some(0.5));
             painter.add(egui::Shape::closed_line(points, stroke));
         }
-        CanvasTool::Select | CanvasTool::Line | CanvasTool::EditNodes => {}
+        CanvasTool::Select
+        | CanvasTool::Line
+        | CanvasTool::EditNodes
+        | CanvasTool::RoundCorners => {}
     }
 }
 
 fn draw_node_preview(painter: &Painter, state: &AppState, pointer: Option<Point>) {
-    let (Interaction::MoveNode { node, start }, Some(pointer)) = (state.interaction, pointer)
-    else {
+    let Some(pointer) = pointer else {
         return;
     };
-    let Some(shape) = state.document.shape(node.shape_id) else {
-        return;
-    };
-    let delta = Vec2::new(pointer.x - start.x, pointer.y - start.y);
-    let Some(path) = move_path_anchor(
-        &editable_path(&shape.world_path()),
-        node.subpath,
-        node.anchor,
-        delta,
-    ) else {
-        return;
+    let path = match state.interaction {
+        Interaction::MoveNode { node, start } => {
+            let Some(shape) = state.document.shape(node.shape_id) else {
+                return;
+            };
+            let delta = Vec2::new(pointer.x - start.x, pointer.y - start.y);
+            let nodes = if state.selected_nodes.contains(&node) {
+                state.selected_nodes.clone()
+            } else {
+                vec![node]
+            };
+            let mut path = editable_path(&shape.world_path());
+            for selected in nodes {
+                if selected.shape_id == node.shape_id
+                    && let Some(updated) =
+                        move_path_anchor(&path, selected.subpath, selected.anchor, delta)
+                {
+                    path = updated;
+                }
+            }
+            path
+        }
+        Interaction::MoveNodeHandle {
+            handle,
+            pointer_offset,
+            opposite_length,
+            smooth,
+        } => {
+            let Some(shape) = state.document.shape(handle.node.shape_id) else {
+                return;
+            };
+            let path = editable_path(&shape.world_path());
+            let target = Point::new(pointer.x + pointer_offset.x, pointer.y + pointer_offset.y);
+            let Some(path) = move_path_control(
+                &path,
+                handle.node,
+                handle.side,
+                target,
+                opposite_length,
+                smooth,
+            ) else {
+                return;
+            };
+            path
+        }
+        _ => return,
     };
     let Ok(polylines) = pf_core::flatten_path(&path, 0.25) else {
         return;
@@ -780,11 +2159,34 @@ fn draw_node_preview(painter: &Painter, state: &AppState, pointer: Option<Point>
     }
 }
 
-fn draw_node_handles(painter: &Painter, state: &AppState) {
-    if state.canvas_tool != CanvasTool::EditNodes {
+fn draw_node_handles(painter: &Painter, state: &AppState, pointer: Option<Point>) {
+    let editing_nodes = state.canvas_tool == CanvasTool::EditNodes;
+    let rounding_corners = state.canvas_tool == CanvasTool::RoundCorners;
+    if !editing_nodes && !rounding_corners {
         return;
     }
     let selected: HashSet<ShapeId> = state.selection.iter().copied().collect();
+    if editing_nodes
+        && let Some(reference) = state.selected_segment
+        && let Some(shape) = state.document.shape(reference.shape_id)
+        && let Some(segment) = editable_path(&shape.world_path())
+            .subpaths()
+            .get(reference.subpath)
+            .and_then(|subpath| subpath.segments().get(reference.segment))
+    {
+        let mut last = segment.point_at(0.0);
+        for step in 1..=24 {
+            let next = segment.point_at(f64::from(step) / 24.0);
+            painter.line_segment(
+                [
+                    to_pos(state.viewport.to_screen(last)),
+                    to_pos(state.viewport.to_screen(next)),
+                ],
+                Stroke::new(3.0, SELECTION_COLOR),
+            );
+            last = next;
+        }
+    }
     for shape in state
         .document
         .shapes()
@@ -793,19 +2195,91 @@ fn draw_node_handles(painter: &Painter, state: &AppState) {
     {
         let path = editable_path(&shape.world_path());
         for (subpath_index, subpath) in path.subpaths().iter().enumerate() {
-            for (anchor, point) in editable_anchors(subpath) {
+            let anchors = if rounding_corners {
+                roundable_anchors(subpath)
+                    .into_iter()
+                    .filter_map(|anchor| anchor_point(subpath, anchor).map(|point| (anchor, point)))
+                    .collect()
+            } else {
+                editable_anchors(subpath)
+            };
+            for (anchor, point) in anchors {
                 let node = NodeRef {
                     shape_id: shape.id,
                     subpath: subpath_index,
                     anchor,
                 };
                 let center = to_pos(state.viewport.to_screen(point));
-                let fill = if state.selected_node == Some(node) {
+                let is_selected = if rounding_corners {
+                    state.rounding_nodes.contains(&node)
+                } else {
+                    state.selected_node == Some(node) || state.selected_nodes.contains(&node)
+                };
+                let fill = if is_selected {
                     SELECTION_COLOR
                 } else {
                     Color32::WHITE
                 };
-                painter.circle(center, 4.0, fill, Stroke::new(1.0, SELECTION_COLOR));
+                let radius = if rounding_corners { 5.0 } else { 4.0 };
+                painter.circle(center, radius, fill, Stroke::new(1.0, SELECTION_COLOR));
+            }
+        }
+    }
+    if let Some(node) = state.selected_node
+        && let Some(shape) = state.document.shape(node.shape_id)
+    {
+        let mut path = editable_path(&shape.world_path());
+        if let (
+            Interaction::MoveNodeHandle {
+                handle,
+                pointer_offset,
+                opposite_length,
+                smooth,
+            },
+            Some(pointer),
+        ) = (state.interaction, pointer)
+            && handle.node == node
+            && let Some(updated) = move_path_control(
+                &path,
+                node,
+                handle.side,
+                Point::new(pointer.x + pointer_offset.x, pointer.y + pointer_offset.y),
+                opposite_length,
+                smooth,
+            )
+        {
+            path = updated;
+        }
+        if let Some((anchor, incoming, outgoing)) = node_control_points(&path, node) {
+            let anchor_screen = to_pos(state.viewport.to_screen(anchor));
+            for (side, control) in [
+                (NodeHandleSide::Incoming, incoming),
+                (NodeHandleSide::Outgoing, outgoing),
+            ] {
+                let Some(control) = control.filter(|point| point.distance(anchor) > 1e-6) else {
+                    continue;
+                };
+                let screen = to_pos(state.viewport.to_screen(control));
+                painter.line_segment(
+                    [anchor_screen, screen],
+                    Stroke::new(1.0, SELECTION_COLOR.gamma_multiply(0.8)),
+                );
+                let rect = egui::Rect::from_center_size(screen, egui::vec2(7.0, 7.0));
+                let fill = match state.interaction {
+                    Interaction::MoveNodeHandle { handle, .. }
+                        if handle.node == node && handle.side == side =>
+                    {
+                        SELECTION_COLOR
+                    }
+                    _ => Color32::WHITE,
+                };
+                painter.rect_filled(rect, 0.0, fill);
+                painter.rect_stroke(
+                    rect,
+                    0.0,
+                    Stroke::new(1.0, SELECTION_COLOR),
+                    egui::StrokeKind::Middle,
+                );
             }
         }
     }

@@ -318,6 +318,14 @@ pub fn delete_selection(state: &mut AppState) {
     apply(state, Command::DeleteShapes(ids));
 }
 
+pub fn delete_shape(state: &mut AppState, id: ShapeId) {
+    if state.document.shape(id).is_none() {
+        return;
+    }
+    apply(state, Command::DeleteShapes(vec![id]));
+    state.selection.retain(|selected| *selected != id);
+}
+
 /// Refreshes the port list and keeps the chosen port, or picks the first.
 pub fn refresh_ports(state: &mut AppState) {
     match list_ports() {
@@ -561,6 +569,35 @@ pub fn assign_selection(state: &mut AppState, layer: LayerId) {
     }
     let ids = state.selection.clone();
     apply(state, Command::AssignShapes { ids, layer });
+}
+
+/// Creates a new layer as one undoable document edit and selects it.
+pub fn add_layer(state: &mut AppState, name: String, color: [u8; 3]) {
+    let before = state.document.layers().len();
+    apply(state, Command::AddLayer { name, color });
+    if state.document.layers().len() > before
+        && let Some(layer) = state.document.layers().last()
+    {
+        state.selected_layer = Some(layer.id);
+        state.draft_layer_color = color;
+        state.set_status(StatusLevel::Info, format!("Layer {} selected", layer.name));
+    }
+}
+
+/// Selects the matching layer color, creating an undoable layer when needed.
+pub fn select_or_add_palette_layer(state: &mut AppState, index: usize, color: [u8; 3]) {
+    if let Some(layer) = state
+        .document
+        .layers()
+        .iter()
+        .find(|layer| layer.color == color)
+    {
+        state.selected_layer = Some(layer.id);
+        state.draft_layer_color = color;
+        state.set_status(StatusLevel::Info, format!("Layer {index:02} selected"));
+    } else {
+        add_layer(state, format!("{index:02}"), color);
+    }
 }
 
 pub fn select_all(state: &mut AppState) {
